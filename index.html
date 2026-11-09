@@ -1074,7 +1074,7 @@ function initGL() {
       if(uTintOn>0.5){float l=dot(base.rgb,vec3(.3,.59,.11));base.rgb=clamp(uTint*l*2.2,0.0,1.0);}
       if(uAlphaMode>0.5 && base.a<0.04) discard;
       vec3 alb=base.rgb;float rough=0.62;float metal=0.0;
-      if(uUseMk>0.5){vec4 m=texture2D(uMk,vT);vec4 mt=texture2D(uMat,vT);alb=mix(alb,m.rgb,m.a);float cov=clamp(mt.a,0.0,1.0)*m.a;rough=mix(rough,mt.r,cov);metal=mix(0.0,mt.g,cov);}
+      if(uUseMk>0.5){vec4 m=texture2D(uMk,vT);vec4 mt=texture2D(uMat,vT);alb=alb*(1.0-m.a)+m.rgb;float cov=clamp(mt.a,0.0,1.0);vec2 mr=mt.rg/max(mt.a,0.0001);rough=mix(rough,mr.x,cov);metal=mr.y*cov;}
       vec3 N=normalize(vN);vec3 V=normalize(uEye-vP);if(dot(N,V)<0.0)N=-N;
       vec3 L1=normalize(vec3(0.55,0.7,0.9));vec3 L2=normalize(vec3(-0.8,0.2,0.5));vec3 L3=normalize(vec3(0.0,0.4,-1.0));
       vec3 dif=alb*(1.0-metal);
@@ -1142,11 +1142,11 @@ function upload(m) {
   const mkb = (data, target = gl.ARRAY_BUFFER) => { const b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, data, gl.STATIC_DRAW); return b; };
   return { pos: mkb(m.pos), nrm: mkb(m.nrm), uv: mkb(m.uv), idx: mkb(m.idx, gl.ELEMENT_ARRAY_BUFFER), n: m.idx.length, type: m.idx instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT };
 }
-function texFrom(src, t) {
+function texFrom(src, t, premult) {
   t = t || gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, t);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !!premult); // premultiplied makeup filters without dark fringes
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
   const pot = (src.width & (src.width - 1)) === 0 && (src.height & (src.height - 1)) === 0;
   if (pot) { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
@@ -1168,11 +1168,13 @@ function tintHair(img, hex) {
   g.putImageData(id, 0, 0);
   return c;
 }
-let browCanvas, lashCanvas;
+let browCanvas, lashCanvas, browData, lashData;
 function updateLashTextures() {
   browCanvas = tintHair(extraImgs[19], S.browColor);
   lashCanvas = tintHair(extraImgs[22], S.lashColor);
-  if (GL.ok) { texFrom(browCanvas, GL.tex.brows); texFrom(lashCanvas, GL.tex.lashes); }
+  browData = bleedImageData(ctx2(browCanvas, { willReadFrequently: true }).getImageData(0, 0, browCanvas.width, browCanvas.height));
+  lashData = bleedImageData(ctx2(lashCanvas, { willReadFrequently: true }).getImageData(0, 0, lashCanvas.width, lashCanvas.height));
+  if (GL.ok) { texFrom(browData, GL.tex.brows); texFrom(lashData, GL.tex.lashes); }
   GL.needs = true;
 }
 
@@ -1200,8 +1202,8 @@ function render3d() {
   if (!GL.ok) return;
   const W = glc.width, H = glc.height;
   if (GL.headDirty) { texFrom(headTinted, GL.tex.head); GL.headDirty = false; }
-  if (GL.mkDirty) { texFrom(composite, GL.tex.mk); GL.mkDirty = false; }
-  if (GL.matDirty) { texFrom(matComp, GL.tex.mat); GL.matDirty = false; }
+  if (GL.mkDirty) { texFrom(composite, GL.tex.mk, true); GL.mkDirty = false; }
+  if (GL.matDirty) { texFrom(matComp, GL.tex.mat, true); GL.matDirty = false; }
   gl.viewport(0, 0, W, H);
   gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
@@ -1955,6 +1957,56 @@ function makeZip(files) { // [{name, data:Uint8Array}] stored, no compression (P
   e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, cdSize, true); e.setUint32(16, off, true);
   return new Blob([...parts, ...central, new Uint8Array(e.buffer)], { type: 'application/zip' });
 }
+/* Edge padding ("alpha bleeding"): give invisible and near-invisible pixels the colour of the nearest
+   visibly painted pixel. Alpha is untouched, so nothing new shows up, but when Roblox filters or
+   mipmaps the texture the soft edges blend with makeup colour instead of black. */
+function bleedImageData(id, minAlpha = 24) {
+  const W = id.width, H = id.height, d = id.data, N = W * H;
+  const src = new Int32Array(N).fill(-1), q = new Int32Array(N);
+  let head = 0, tail = 0;
+  for (let i = 0; i < N; i++) if (d[i * 4 + 3] >= minAlpha) { src[i] = i; q[tail++] = i; }
+  if (!tail) return id;
+  while (head < tail) {
+    const i = q[head++], x = i % W, from = src[i];
+    if (x > 0 && src[i - 1] < 0) { src[i - 1] = from; q[tail++] = i - 1; }
+    if (x < W - 1 && src[i + 1] < 0) { src[i + 1] = from; q[tail++] = i + 1; }
+    if (i >= W && src[i - W] < 0) { src[i - W] = from; q[tail++] = i - W; }
+    if (i + W < N && src[i + W] < 0) { src[i + W] = from; q[tail++] = i + W; }
+  }
+  for (let i = 0; i < N; i++) {
+    const o = i * 4, f = src[i] * 4;
+    if (src[i] !== i && f >= 0) { d[o] = d[f]; d[o + 1] = d[f + 1]; d[o + 2] = d[f + 2]; }
+  }
+  return id;
+}
+// Minimal PNG writer (RGBA8) so transparent pixels keep their padded colour; canvas.toBlob would zero them.
+async function encodePNG(id) {
+  const W = id.width, H = id.height, d = id.data, stride = W * 4;
+  const raw = new Uint8Array((stride + 1) * H);
+  for (let y = 0; y < H; y++) { // filter 1 (Sub) per row
+    const o = y * (stride + 1), r = y * stride; raw[o] = 1;
+    for (let x = 0; x < stride; x++) raw[o + 1 + x] = (d[r + x] - (x >= 4 ? d[r + x - 4] : 0)) & 255;
+  }
+  const z = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('deflate'))).arrayBuffer());
+  const enc = new TextEncoder();
+  const chunk = (type, data) => {
+    const out = new Uint8Array(12 + data.length), dv = new DataView(out.buffer);
+    dv.setUint32(0, data.length); out.set(enc.encode(type), 4); out.set(data, 8);
+    dv.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)));
+    return out;
+  };
+  const ihdr = new Uint8Array(13), hv = new DataView(ihdr.buffer);
+  hv.setUint32(0, W); hv.setUint32(4, H); ihdr[8] = 8; ihdr[9] = 6;
+  const parts = [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', z), chunk('IEND', new Uint8Array(0))];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+async function paddedPng(src) { // canvas or ImageData with alpha -> edge-padded PNG bytes
+  const id = src instanceof ImageData ? new ImageData(new Uint8ClampedArray(src.data), src.width, src.height)
+    : ctx2(src, { willReadFrequently: true }).getImageData(0, 0, src.width, src.height);
+  if (typeof CompressionStream === 'undefined') return canvasPng(src instanceof ImageData ? (() => { const c = mk(id.width, id.height); ctx2(c).putImageData(id, 0, 0); return c; })() : src);
+  return encodePNG(bleedImageData(id));
+}
 const canvasPng = c => new Promise((res, rej) => c.toBlob(b => b ? b.arrayBuffer().then(a => res(new Uint8Array(a))) : rej(new Error('toBlob failed')), 'image/png'));
 /* Split a full-face layer into Face / Eyes / Lips pieces.
    Roblox stacks the decals Face, then Eyes, then Lips. With paint alpha a and ownership ramps tL, tE:
@@ -2027,7 +2079,7 @@ async function buildExport(name, size, withBrows, gltfOnly, withHair = true) {
   const R = { };
   for (const r of REGIONS) {
     const alb = regionAlbedo(r, size), rgh = regionScalar(r, 'rough', size), met = regionScalar(r, 'metal', size), nor = flatNormal(size);
-    R[r] = { alb: await canvasPng(alb), rgh: await canvasPng(rgh), met: await canvasPng(met), nor: await canvasPng(nor), mr: await canvasPng(packMR(met, rgh, size)) };
+    R[r] = { alb: await paddedPng(alb), rgh: await canvasPng(rgh), met: await canvasPng(met), nor: await canvasPng(nor), mr: await canvasPng(packMR(met, rgh, size)) };
     files.push({ name: `textures/${name}_${r}_ALB.png`, data: R[r].alb }, { name: `textures/${name}_${r}_RGH.png`, data: R[r].rgh },
       { name: `textures/${name}_${r}_MET.png`, data: R[r].met }, { name: `textures/${name}_${r}_NOR.png`, data: R[r].nor });
     const [ni, ai, mi] = REGION_IMG[r];
@@ -2036,8 +2088,8 @@ async function buildExport(name, size, withBrows, gltfOnly, withHair = true) {
     images[mi] = { bytes: R[r].mr, mime: 'image/png', name: `${name}_${r}_MET-${name}_${r}_RGH` };
   }
   // brows / lashes with chosen colour
-  images[19] = { bytes: await canvasPng(browCanvas), mime: 'image/png' };
-  images[22] = { bytes: await canvasPng(lashCanvas), mime: 'image/png' };
+  images[19] = { bytes: await paddedPng(browData), mime: 'image/png' };
+  images[22] = { bytes: await paddedPng(lashData), mime: 'image/png' };
   // glTF: template JSON + geometry + images
   const g = JSON.parse(JSON.stringify(G));
   const chunks = [geomBytes]; let len = geomBytes.length;
