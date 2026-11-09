@@ -260,6 +260,7 @@ dialog::backdrop{background:rgba(20,12,22,.6)}
       <div class="pane-tag">Head <span class="hint">right-drag or Shift-drag to turn, wheel to zoom</span></div>
       <div class="cam-btns">
         <button data-cam="left">Left</button><button data-cam="three">¾</button><button data-cam="front" class="on">Front</button><button data-cam="threeR">¾</button><button data-cam="right">Right</button>
+        <button class="toggle mini" id="btnProj" aria-pressed="true" title="Projection painting: strokes are projected from your view onto the head (reverse projection), so they stay round across seams and skip surfaces facing away or hidden behind others">Project</button>
         <button class="toggle mini" id="btnHair" aria-pressed="true" title="Show or hide the reference hair">Hair</button>
         <button class="toggle mini" id="btnRotate" aria-pressed="false" title="Turn mode: left-drag rotates instead of painting (handy on touch)">Turn</button>
       </div>
@@ -385,6 +386,7 @@ dialog::backdrop{background:rgba(20,12,22,.6)}
       <tr><td>Alt (hold)</td><td>Eyedropper</td></tr>
       <tr><td>Space + drag, wheel</td><td>Pan and zoom the texture</td></tr>
       <tr><td>Right-drag or Shift-drag on head</td><td>Turn the head</td></tr>
+      <tr><td>Project (on the head view)</td><td>Projection painting: strokes on the head are projected from your view, like a decal, instead of following the texture</td></tr>
       <tr><td>M / R</td><td>Toggle mirror / clip to region</td></tr>
       <tr><td>Ctrl+Z, Ctrl+Shift+Z</td><td>Undo, redo</td></tr>
       <tr><td>0</td><td>Fit texture</td></tr>
@@ -1087,6 +1089,34 @@ function initGL() {
       float uh=floor(u/16.0);float ul=u-uh*16.0;float vh=floor(v/256.0);float vl=v-vh*256.0;
       gl_FragColor=vec4(uh/255.0,(ul*16.0+vh)/255.0,vl/255.0,1.0);}`;
   GL.prog = program(vs, fsMain); GL.pick = program(vs, fsPick);
+  // --- Reverse projection (Lim et al., SIGGRAPH '23 posters): paint lands in the texture by projecting every
+  // texel's local-space position into the projector (the camera), instead of stamping dabs in UV space. ---
+  const fsDepth = `precision ${prec} float;varying vec3 vN;varying vec2 vT;varying vec3 vP;
+    vec4 pack(float d){vec4 e=fract(d*vec4(1.0,255.0,65025.0,16581375.0));e-=e.yzww*vec4(1.0/255.0,1.0/255.0,1.0/255.0,0.0);return e;}
+    void main(){gl_FragColor=pack(gl_FragCoord.z);}`;
+  // UV-space pass: each fragment is one texel of the head texture, carrying its local position and normal
+  // (the paper's local space positional / normal maps, rasterised on the fly).
+  const vsProj = `attribute vec3 aP;attribute vec3 aN;attribute vec2 aT;uniform mat4 uMVP;
+    varying vec4 vClip;varying vec3 vN;varying vec3 vP;
+    void main(){vClip=uMVP*vec4(aP,1.0);vN=aN;vP=aP;gl_Position=vec4(aT.x*2.0-1.0,aT.y*2.0-1.0,0.0,1.0);}`;
+  const fsProj = `precision ${prec} float;varying vec4 vClip;varying vec3 vN;varying vec3 vP;
+    uniform sampler2D uStroke;uniform sampler2D uDepth;uniform vec3 uEye;uniform float uBias;
+    float unpack(vec4 c){return dot(c,vec4(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0));}
+    void main(){
+      if(vClip.w<=0.0) discard;
+      vec3 ndc=vClip.xyz/vClip.w;
+      if(abs(ndc.x)>1.0||abs(ndc.y)>1.0) discard;                       // outside the projector frustum
+      float facing=dot(normalize(vN),normalize(uEye-vP));
+      if(facing<=0.0) discard;                                            // back-face culling (paper)
+      vec2 suv=ndc.xy*0.5+0.5;
+      float sceneD=unpack(texture2D(uDepth,suv));
+      if(ndc.z*0.5+0.5>sceneD+uBias) discard;                              // occluded from the camera (e.g. behind the nose)
+      vec4 c=texture2D(uStroke,vec2(suv.x,1.0-suv.y));
+      float graze=smoothstep(0.06,0.32,facing);                            // fade where the surface turns edge-on
+      gl_FragColor=vec4(c.rgb,c.a*graze);}`;
+  GL.depthProg = program(vs, fsDepth); GL.projProg = program(vsProj, fsProj);
+  GL.proj = { depthFbo: gl.createFramebuffer(), depthTex: gl.createTexture(), depthRb: gl.createRenderbuffer(), depthSize: [0, 0],
+    uvFbo: gl.createFramebuffer(), uvTex: gl.createTexture(), uvSize: 0, strokeTex: gl.createTexture() };
   GL.meshes = {
     head: upload(meshData(3)), eyes: upload(meshData(1)), hair: upload(meshData(2)),
     brows: upload(meshData(11)), lashes: upload(meshData(12)),
@@ -1231,6 +1261,135 @@ function pickUV(clientX, clientY) {
   const u = (out[0] * 16 + (out[1] >> 4)) / 4095, v = ((out[1] & 15) * 256 + out[2]) / 4095;
   return { x: u * S.res, y: v * S.res };
 }
+/* ---- reverse projection painting ---- */
+const proj = { on: true, active: false, cv: null, ctx: null, last: null, carry: 0, air: null, queued: false, buf: null, bufW: 0 };
+const PROJ_TOOLS = new Set(['brush', 'air', 'eraser', 'stamp']);
+function projUsable() { return proj.on && GL.ok && PROJ_TOOLS.has(S.tool); }
+function setupTarget(fbo, tex, w, h, rb) {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (rb) { gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h); gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb); }
+}
+function projScreenRadius(pz) { // brush radius in device pixels, matching the 3D cursor ring
+  const dpr = glc.width / glc.getBoundingClientRect().width;
+  const size = S.size * (S.pressure && S.tool !== 'stamp' ? (0.25 + 0.75 * pz) : 1);
+  return Math.max(0.6, (size / 2) / S.res * 0.75 * pxPerUnit() * dpr);
+}
+function projClientToDev(e) { const r = glc.getBoundingClientRect(), k = glc.width / r.width; return { x: (e.clientX - r.left) * k, y: (e.clientY - r.top) * k }; }
+function projDab(x, y, pz) {
+  const g = proj.ctx;
+  if (S.tool === 'stamp') {
+    const size = projScreenRadius(1) * 2, rot = S.stampRot * Math.PI / 180;
+    g.save(); g.translate(x, y); g.rotate(rot); g.scale(size / 24, size / 24); g.translate(-12, -12);
+    g.fillStyle = S.color; g.fill(stampPaths[S.stamp]); g.restore(); return;
+  }
+  const ts = toolSettings[S.tool], r = projScreenRadius(pz);
+  const tip = getTip(1 - ts.soft / 100, stroke.erase ? '#000000' : S.color);
+  g.globalAlpha = clamp((ts.flow / 100) * (S.pressure ? (0.35 + 0.65 * pz) : 1), 0.002, 1);
+  g.drawImage(tip, x - r, y - r, r * 2, r * 2); g.globalAlpha = 1;
+}
+function projLineTo(x, y, pz) {
+  const l = proj.last; if (!l) { projDab(x, y, pz); proj.last = { x, y, p: pz }; proj.carry = 0; return; }
+  const dx = x - l.x, dy = y - l.y, dist = Math.hypot(dx, dy), spacing = Math.max(0.6, projScreenRadius(pz) * 0.24);
+  let t = spacing - proj.carry;
+  while (t <= dist) { const f = t / dist; projDab(l.x + dx * f, l.y + dy * f, l.p + (pz - l.p) * f); t += spacing; }
+  proj.carry = dist - (t - spacing); proj.last = { x, y, p: pz };
+}
+function projBegin(e) {
+  const L = S.active;
+  if (!L) return false;
+  if (!L.visible) { toast('This layer is hidden. Show it to paint on it.'); return false; }
+  if (!proj.cv) { proj.cv = mk(1); proj.ctx = ctx2(proj.cv); }
+  if (proj.cv.width !== glc.width || proj.cv.height !== glc.height) { proj.cv.width = glc.width; proj.cv.height = glc.height; }
+  proj.ctx.clearRect(0, 0, proj.cv.width, proj.cv.height);
+  stroke.active = true; stroke.layer = L; stroke.erase = S.tool === 'eraser';
+  stroke.clip = S.clip && !stroke.erase;
+  stroke.alpha = (S.tool === 'stamp' ? toolSettings.stamp.opacity : toolSettings[S.tool].opacity) / 100;
+  bbox.any = false; strokeCtx.clearRect(0, 0, S.res, S.res);
+  undoBefore = L.ctx.getImageData(0, 0, S.res, S.res);
+  lastPt = null;
+  proj.active = true; proj.last = null; proj.carry = 0;
+  renderProjDepth();                           // camera depth for occlusion, once per stroke (the view can't move mid-stroke)
+  const p = projClientToDev(e); projLineTo(p.x, p.y, pressureOf(e));
+  if (S.tool === 'stamp') proj.last = null;
+  if (S.tool === 'air') { proj.air = { ...p, pz: pressureOf(e) }; clearInterval(airTimer); airTimer = setInterval(() => { if (proj.active && proj.air) { projDab(proj.air.x, proj.air.y, proj.air.pz); queueProject(); } }, 45); }
+  queueProject();
+  return true;
+}
+function projMove(e) {
+  if (S.tool === 'stamp') return;
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ce of (evs.length ? evs : [e])) { const p = projClientToDev(ce); projLineTo(p.x, p.y, pressureOf(ce)); if (proj.air) proj.air = { ...p, pz: pressureOf(ce) }; }
+  queueProject();
+}
+function projEnd() {
+  if (!proj.active) return;
+  clearInterval(airTimer); airTimer = null; proj.air = null;
+  projectNow();                                // make sure the last dabs are in
+  proj.active = false;
+  const t = S.tool; endStroke();
+  if (t === 'stamp' || t === 'brush' || t === 'air') addRecent(S.color);
+}
+function queueProject() { if (proj.queued) return; proj.queued = true; requestAnimationFrame(() => { proj.queued = false; if (proj.active) projectNow(); }); }
+function renderProjDepth() {
+  const W = glc.width, H = glc.height, P = GL.proj;
+  if (P.depthSize[0] !== W || P.depthSize[1] !== H) { setupTarget(P.depthFbo, P.depthTex, W, H, P.depthRb); P.depthSize = [W, H]; }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, P.depthFbo);
+  gl.viewport(0, 0, W, H); gl.clearColor(1, 1, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE);
+  const D = GL.depthProg; gl.useProgram(D.p);
+  gl.uniformMatrix4fv(D.u.uMVP, false, new Float32Array(mvp(W, H)));
+  const occluders = [GL.meshes.head, GL.meshes.eyes]; if (S.showHair) occluders.push(GL.meshes.hair);
+  for (const m of occluders) { bindMesh(m); gl.drawElements(gl.TRIANGLES, m.n, m.type, 0); }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+function projectNow() {
+  const R = S.res, P = GL.proj;
+  if (P.uvSize !== R) { setupTarget(P.uvFbo, P.uvTex, R, R, null); P.uvSize = R; }
+  texFrom(proj.cv, P.strokeTex);
+  gl.bindTexture(gl.TEXTURE_2D, P.strokeTex); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, P.uvFbo);
+  gl.viewport(0, 0, R, R); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE);
+  const Q = GL.projProg; gl.useProgram(Q.p);
+  gl.uniformMatrix4fv(Q.u.uMVP, false, new Float32Array(mvp(glc.width, glc.height)));
+  gl.uniform3fv(Q.u.uEye, eyePos()); gl.uniform1f(Q.u.uBias, 0.0006);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, P.strokeTex); gl.uniform1i(Q.u.uStroke, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, P.depthTex); gl.uniform1i(Q.u.uDepth, 1);
+  bindMesh(GL.meshes.head); gl.drawElements(gl.TRIANGLES, GL.meshes.head.n, GL.meshes.head.type, 0);
+  if (!proj.buf || proj.bufW !== R) { proj.buf = new Uint8ClampedArray(R * R * 4); proj.bufW = R; }
+  gl.readPixels(0, 0, R, R, gl.RGBA, gl.UNSIGNED_BYTE, proj.buf); // row 0 = v 0 = top row of the texture canvas
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.activeTexture(gl.TEXTURE0);
+  const d = proj.buf;
+  // 1-texel dilation so triangle edges on UV seams don't leave hairline gaps
+  let x0 = R, y0 = R, x1 = -1, y1 = -1;
+  const out = new Uint8ClampedArray(d);
+  for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) {
+    const o = (y * R + x) * 4;
+    if (d[o + 3]) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; continue; }
+    let best = -1, ba = 0;
+    if (x > 0 && d[o - 1] > ba) { ba = d[o - 1]; best = o - 4; }
+    if (x < R - 1 && d[o + 7] > ba) { ba = d[o + 7]; best = o + 4; }
+    if (y > 0 && d[o - R * 4 + 3] > ba) { ba = d[o - R * 4 + 3]; best = o - R * 4; }
+    if (y < R - 1 && d[o + R * 4 + 3] > ba) { ba = d[o + R * 4 + 3]; best = o + R * 4; }
+    if (best >= 0) { out[o] = d[best]; out[o + 1] = d[best + 1]; out[o + 2] = d[best + 2]; out[o + 3] = d[best + 3]; }
+  }
+  strokeCtx.putImageData(new ImageData(out, R, R), 0, 0);
+  if (S.sym) { // mirror across the face in texture space
+    scratchCtx.globalCompositeOperation = 'copy'; scratchCtx.drawImage(strokeCanvas, 0, 0); scratchCtx.globalCompositeOperation = 'source-over';
+    strokeCtx.save(); strokeCtx.translate(R, 0); strokeCtx.scale(-1, 1); strokeCtx.drawImage(scratch, 0, 0); strokeCtx.restore();
+    if (x1 >= 0) { const a = R - 1 - x1, b = R - 1 - x0; x0 = Math.min(x0, a); x1 = Math.max(x1, b); }
+  }
+  if (x1 >= 0) { growBox(x0 - 2, y0 - 2, 0); growBox(x1 + 3, y1 + 3, 0); }
+  markDirty(); GL.needs = true;
+}
+$('#btnProj').addEventListener('click', e => { proj.on = !proj.on; e.currentTarget.setAttribute('aria-pressed', proj.on); toast(proj.on ? 'Projection painting on: strokes are projected from your view onto the head.' : 'Projection painting off: strokes follow the texture under the cursor.'); });
+
 /* 3D input */
 const over3d = $('#over3d'), o3 = ctx2(over3d);
 const in3d = { orbit: null, mouse: null, lastUV: null, rotateMode: false, picking: false };
@@ -1244,6 +1403,7 @@ $('#view3d').addEventListener('pointerdown', e => {
   const uv = pickUV(e.clientX, e.clientY);
   if (!uv) { orbitStart(e); return; }       // dragging on empty space turns the head
   if (S.tool === 'pick' || e.altKey) { pickColor(uv.x, uv.y, true); in3d.picking = true; return; }
+  if (projUsable()) { projBegin(e); return; }
   if (beginStroke(uv.x, uv.y, pressureOf(e), false)) in3d.lastUV = uv;
 });
 $('#view3d').addEventListener('pointermove', e => {
@@ -1256,6 +1416,7 @@ $('#view3d').addEventListener('pointermove', e => {
     GL.needs = true; drawOver3d(); return;
   }
   if (in3d.picking) { const uv = pickUV(e.clientX, e.clientY); if (uv) pickColor(uv.x, uv.y, true); return; }
+  if (proj.active) { projMove(e); drawOver3d(); return; }
   if (stroke.active) {
     const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
     for (const ce of (evs.length ? evs : [e])) {
@@ -1271,9 +1432,9 @@ $('#view3d').addEventListener('pointermove', e => {
   }
   drawOver3d();
 });
-const end3d = () => { in3d.orbit = null; in3d.picking = false; in3d.lastUV = null; endStroke(); };
+const end3d = () => { in3d.orbit = null; in3d.picking = false; in3d.lastUV = null; if (proj.active) projEnd(); else endStroke(); };
 $('#view3d').addEventListener('pointerup', end3d);
-$('#view3d').addEventListener('pointercancel', () => { in3d.orbit = null; cancelStroke(); });
+$('#view3d').addEventListener('pointercancel', () => { in3d.orbit = null; proj.active = false; cancelStroke(); });
 $('#view3d').addEventListener('pointerleave', () => { in3d.mouse = null; drawOver3d(); });
 $('#view3d').addEventListener('contextmenu', e => e.preventDefault());
 $('#view3d').addEventListener('wheel', e => { e.preventDefault(); cam.dist = clamp(cam.dist * Math.exp(e.deltaY * 0.0015), 0.7, 5); GL.needs = true; drawOver3d(); }, { passive: false });
@@ -2044,7 +2205,7 @@ async function boot() {
   sizeCanvases(); fit2d(); markDirty(true);
   requestAnimationFrame(frame);
   if (!restored) setTimeout(() => toast('Pick a layer, choose a colour and paint on the texture or the head.', 4200), 400);
-  window.__vanity = { S, undo, redo, setTool, beginStroke, strokeTo, endStroke, buildExport, loadSample, pickUV, cam, GL };
+  window.__vanity = { proj, projectNow, S, undo, redo, setTool, beginStroke, strokeTo, endStroke, buildExport, loadSample, pickUV, cam, GL };
 }
 boot().catch(err => { console.error(err); toast('Vanity failed to start: ' + err.message, 10000); });
 })();
