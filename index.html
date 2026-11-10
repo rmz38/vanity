@@ -495,6 +495,18 @@ function boxBlur(a, W, r) { // separable box blur, in place, on a W x W Float32A
     for (let y = 0; y < W; y++) { a[y * W + x] = acc / n; acc += tmp[Math.min(y + r + 1, W - 1) * W + x] - tmp[Math.max(y - r, 0) * W + x]; } }
   return a;
 }
+function rasterCover(m, W) { // which texels a mesh covers in UV space (1 = covered)
+  const c = mk(W), g = ctx2(c, { willReadFrequently: true });
+  g.fillStyle = '#fff'; g.beginPath();
+  for (let i = 0; i < m.idx.length; i += 3) {
+    const a = m.idx[i] * 2, b = m.idx[i + 1] * 2, d = m.idx[i + 2] * 2;
+    g.moveTo(m.uv[a] * W, m.uv[a + 1] * W); g.lineTo(m.uv[b] * W, m.uv[b + 1] * W); g.lineTo(m.uv[d] * W, m.uv[d + 1] * W); g.closePath();
+  }
+  g.fill();
+  const d = g.getImageData(0, 0, W, W).data, out = new Uint8Array(W * W);
+  for (let i = 0; i < out.length; i++) out[i] = d[i * 4 + 3] >= 128 ? 1 : 0;
+  return out;
+}
 function ownershipRamp(binCanvas, W) {
   const k = W / 1024, d = ctx2(binCanvas, { willReadFrequently: true }).getImageData(0, 0, W, W).data;
   const m = new Float32Array(W * W); for (let i = 0; i < m.length; i++) m[i] = d[i * 4 + 3] / 255;
@@ -565,6 +577,24 @@ function buildMasks() {
       for (let i = 0; i < meshRamp.length; i++) meshRamp[i] = Math.min(meshRamp[i], d[i * 4] / 255);
     }
     own[r] = meshRamp;
+  }
+  // Roblox's Face transfer mesh has holes around the eyes and mouth. Paint there can only be drawn by the
+  // Eyes / Lips meshes, so they must own it fully inside the hole and hand back to Face just outside it.
+  const faceCover = rasterCover(meshData(REGION_MESH.Face), R0);
+  for (const r of ['Eyes', 'Lips']) {
+    const rc = rasterCover(meshData(REGION_MESH[r]), R0), k0 = R0 / 1024;
+    const rcBlur = boxBlur(Float32Array.from(rc), R0, Math.max(1, Math.round(2 * k0)));
+    const regionCover = new Uint8Array(rc.length); for (let i = 0; i < rc.length; i++) regionCover[i] = (rc[i] || rcBlur[i] > 0.02) ? 1 : 0; // include hairline slits
+    const hole = new Float32Array(R0 * R0);
+    for (let i = 0; i < hole.length; i++) hole[i] = (!faceCover[i] && regionCover[i]) ? 1 : 0;
+    const k = R0 / 1024, grown = boxBlur(Float32Array.from(hole), R0, Math.round(4 * k));
+    for (let i = 0; i < grown.length; i++) grown[i] = grown[i] > 0.02 ? 1 : 0;   // grow the hole ~4px
+    const ramp = boxBlur(boxBlur(grown, R0, Math.round(4 * k)), R0, Math.round(4 * k));
+    const t = own[r];
+    for (let i = 0; i < t.length; i++) {
+      const h = hole[i] ? 1 : Math.min(1, ramp[i] * 1.6);
+      if (regionCover[i] && h > t[i]) t[i] = h;
+    }
   }
   // overlay that shows where a full-face layer will be cut
   splitOverlay = mk(R0);
@@ -2015,17 +2045,24 @@ const canvasPng = c => new Promise((res, rej) => c.toBlob(b => b ? b.arrayBuffer
    changing smoothly, so texture filtering at the joins cannot open a visible line. Colour is the same in
    every piece. Opacity is baked in. */
 function splitPieces(L, opacity = 1) {
+  /* Both textures change smoothly: the upper piece (Eyes / Lips) reaches full strength halfway across the
+     overlap band, and only then does the piece underneath fade out over the inner half. Stacked "over" each
+     other they still add back up to exactly the painted alpha, but no piece has a hard cut that could show
+     through when Roblox renders a region slightly softer than 100%. */
   const W = S.res, src = L.ctx.getImageData(0, 0, W, W).data;
   const out = {}, dat = {};
   for (const r of REGIONS) { out[r] = mk(W); dat[r] = new ImageData(W, W); }
   const dF = dat.Face.data, dE = dat.Eyes.data, dL = dat.Lips.data, tL = own.Lips, tE = own.Eyes;
+  const ss = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+  const up = t => ss(0, 0.7, t), keep = t => 1 - ss(0.7, 1, t);
+  const below = (a, top, k) => (top >= 0.9999 ? 1 : (a - top) / (1 - top)) * k; // what the layers underneath must add
   for (let i = 0, p = 0; i < tL.length; i++, p += 4) {
     const a = src[p + 3] / 255 * opacity;
     if (a <= 0) continue;
-    const aL = a * tL[i];
-    const rest = aL >= 0.9999 ? 0 : (a - aL) / (1 - aL);
-    const aE = rest * tE[i];
-    const aF = aE >= 0.9999 ? 0 : (rest - aE) / (1 - aE);
+    const aL = a * up(tL[i]);
+    const rest = clamp(below(a, aL, keep(tL[i])), 0, 1);
+    const aE = rest * up(tE[i]);
+    const aF = clamp(below(rest, aE, keep(tE[i])), 0, 1);
     const put = (d, al) => { if (al <= 0) return; d[p] = src[p]; d[p + 1] = src[p + 1]; d[p + 2] = src[p + 2]; d[p + 3] = Math.round(clamp(al, 0, 1) * 255); };
     put(dL, aL); put(dE, aE); put(dF, aF);
   }
