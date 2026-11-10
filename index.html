@@ -2106,11 +2106,17 @@ async function buildExport(name, size, withBrows, gltfOnly, withHair = true) {
   const all = new Uint8Array(len); let o = 0; for (const c of chunks) { all.set(c, o); o += c.length; }
   g.buffers = [{ byteLength: len, uri: 'data:application/octet-stream;base64,' + b64(all) }];
   g.asset = { version: '2.0', generator: 'Vanity Roblox makeup editor (from Roblox makeup template)' };
-  // record Roblox's makeup cage UV validation bounds on the makeup nodes (values only; textures are untouched)
-  const boundsExtras = { RobloxMakeupCageUVBounds: Object.assign({ space: 'cage UV' }, CAGE_UV_BOUNDS) };
-  g.nodes.forEach(n => { if (/^TransferTexture_|^Makeup$/.test(n.name || '')) n.extras = Object.assign({}, n.extras, boundsExtras); });
-  g.extras = Object.assign({}, g.extras, boundsExtras);
-  files.push({ name: 'uv-bounds.json', data: new TextEncoder().encode(JSON.stringify(boundsExtras.RobloxMakeupCageUVBounds, null, 2)) });
+  // Roblox validates makeup against the cage UV bounds stored as custom properties on the cage nodes
+  // (TransferUVMinBound / TransferUVMaxBound, "u, v" strings, as in the template). Write the current values.
+  const b = CAGE_UV_BOUNDS, fmt = (u, v) => `${u / 1e6}, ${v / 1e6}`;
+  const minB = fmt(b.FIntUGCValidateMakeupMinUBound, b.FIntUGCValidateMakeupMinVBound);
+  const maxB = fmt(b.FIntUGCValidateMakeupMaxUBound, b.FIntUGCValidateMakeupMaxVBound);
+  for (const n of g.nodes) {
+    if (n.extras && ('TransferUVMinBound' in n.extras || 'TransferUVMaxBound' in n.extras || /_(Outer|Inner)Cage$/.test(n.name || ''))) {
+      n.extras = Object.assign({}, n.extras, { TransferUVMinBound: minB, TransferUVMaxBound: maxB });
+    }
+  }
+  files.push({ name: 'uv-bounds.json', data: new TextEncoder().encode(JSON.stringify(Object.assign({ TransferUVMinBound: minB, TransferUVMaxBound: maxB }, b), null, 2)) });
   if (!withHair) { // drop the reference hair from the head
     const hi = g.nodes.findIndex(n => n.name === 'FullHead_Hair');
     g.nodes.forEach(n => { if (n.children) n.children = n.children.filter(c => c !== hi); });
@@ -2167,8 +2173,9 @@ Bringing it into Roblox Studio
   4. Press Play to see it on the avatar.
 
 Roblox's makeup UV validation bounds (FIntUGCValidateMakeup*Bound) are in
-cage UV space. Their values are written to uv-bounds.json and to the glTF
-"extras" of the makeup nodes; the textures themselves are not cut.
+cage UV space. They are written to the TransferUVMinBound / TransferUVMaxBound
+custom properties on the cage nodes (TransferTarget_FullHead_OuterCage and the
+eyebrow/eyelash cages), and listed in uv-bounds.json.
 
 Marketplace uploads are limited to 1024 px textures; in-experience creation
 allows up to 4K.
