@@ -2287,14 +2287,19 @@ async function buildExport(name, size, withBrows, gltfOnly, withHair = true) {
   images[22] = { bytes: await paddedPng(lashData), mime: 'image/png' };
   // glTF: template JSON + geometry + images
   const g = JSON.parse(JSON.stringify(G));
-  if (S.space === 'cage') { // makeup meshes that carry cage UVs (tile u 3-4), clipped to the validator bounds
-    for (const r of REGIONS) {
-      const a = A.cageMeshes[r], prim = g.meshes[REGION_MESH[r]].primitives[0];
-      prim.attributes = { POSITION: a.POSITION, NORMAL: a.NORMAL, TEXCOORD_0: a.TEXCOORD_0 }; prim.indices = a.indices;
-    }
-  }
   const chunks = [geomBytes]; let len = geomBytes.length;
   const pad = () => { const p = (4 - (len % 4)) % 4; if (p) { chunks.push(new Uint8Array(p)); len += p; } };
+  if (S.space === 'cage') { // makeup meshes cut from the cage layout, clipped to the validator bounds
+    for (const r of REGIONS) {
+      const a = A.cageMeshes[r], prim = g.meshes[REGION_MESH[r]].primitives[0];
+      // Their template UVs sit in tile u 3-4, but the textures are painted in 0-1 and Roblox doesn't tile makeup
+      // UVs, so write the shifted UVs the editor paints with (as head mode does)
+      const uv = cageMeshData(r).uv;
+      pad(); g.bufferViews.push({ buffer: 0, byteOffset: len, byteLength: uv.byteLength }); chunks.push(new Uint8Array(uv.buffer)); len += uv.byteLength;
+      g.accessors.push({ bufferView: g.bufferViews.length - 1, componentType: 5126, count: uv.length / 2, type: 'VEC2' });
+      prim.attributes = { POSITION: a.POSITION, NORMAL: a.NORMAL, TEXCOORD_0: g.accessors.length - 1 }; prim.indices = a.indices;
+    }
+  }
   g.images = g.images.map((im, i) => {
     const src = images[i] || dataUriBytes(A.images[String(i)]);
     pad();
