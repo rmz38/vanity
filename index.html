@@ -616,7 +616,7 @@ function buildMasks() {
   // over to Eyes/Lips gradually across the whole striped band, and never closer than ~9px to the edge of
   // Roblox's Eyes/Lips transfer meshes, so small differences in how Roblox lines the regions up stay invisible.
   // Eyes / Lips own their whole zone on the face template (striped + solid), Face owns the rest. The cut sits
-  // exactly on the outer edge of the striped area with a ~1px anti-aliased edge, clipped to the region's mesh.
+  // exactly on the outer edge of the striped area, clipped to the region's mesh, with an overlap band just inside it.
   for (const r of ['Eyes', 'Lips']) {
     const t = new Float32Array(R0 * R0);
     const zimg = cageMode ? cageImg[r] : zoneImg[r];
@@ -624,6 +624,11 @@ function buildMasks() {
       const c = mk(R0), g = ctx2(c, { willReadFrequently: true }); g.imageSmoothingQuality = 'high'; g.drawImage(zimg, 0, 0, R0, R0);
       const d = g.getImageData(0, 0, R0, R0).data, cov = rasterCover(regionMesh(r), R0);
       for (let i = 0; i < t.length; i++) t[i] = cov[i] ? d[i * 4] / 255 : 0;
+      // Ownership then rises over ~8px inward from the cut, so Eyes / Lips fade in on top of Face before Face
+      // fades out underneath (see splitPieces). With a 1px hand-over both pieces are half transparent on the
+      // same texel once Roblox filters them, and skin shows through as a light seam.
+      const b = boxBlur(Float32Array.from(t), R0, Math.max(1, Math.round(8 * R0 / 1024)));
+      for (let i = 0; i < t.length; i++) t[i] = Math.min(t[i], clamp(2 * b[i] - 1, 0, 1));
     }
     own[r] = t;
   }
